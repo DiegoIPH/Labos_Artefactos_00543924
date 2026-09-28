@@ -1,4 +1,4 @@
-#include <WiFi.h>                     
+#include <WiFi.h>
 #include "Adafruit_MQTT.h"
 #include "Adafruit_MQTT_Client.h"
 
@@ -10,7 +10,7 @@
 #define AIO_SERVER      "io.adafruit.com"
 #define AIO_SERVERPORT  1883
 #define AIO_USERNAME    "DiegoIPH"   
-#define AIO_KEY         ""           //(no la subas a repositorio)
+#define AIO_KEY         ""
 
 // ---------------------- PINES ----------------------
 #define TRIG_PIN  18
@@ -23,21 +23,23 @@
 #define RGB_ANODO_COMUN  false      
 #define PWM_FREQ         5000
 #define PWM_RES          8         
-#define INTERVALO_PUBLICAR_MS 5000  // Adafruit gratis limita los datos por minuto: no bajar de 4-5 s
+#define INTERVALO_PUBLICAR_MS 5000
 #define DIST_CERCA_CM    10     
 #define DIST_MEDIA_CM    20    
 
-// ---------------------- CLIENTE MQTT Y FEED ----------------------
+// ---------------------- CLIENTE MQTT Y FEEDS ----------------------
 WiFiClient client;
 Adafruit_MQTT_Client mqtt(&client, AIO_SERVER, AIO_SERVERPORT, AIO_USERNAME, AIO_KEY);
 
-// Publicar
 Adafruit_MQTT_Publish feedDistancia = Adafruit_MQTT_Publish(&mqtt, AIO_USERNAME "/feeds/distancia");
 
+Adafruit_MQTT_Subscribe feedLedToggle = Adafruit_MQTT_Subscribe(&mqtt, AIO_USERNAME "/feeds/apagar");
+
 // ---------------------- ESTADO ----------------------
-float ultimaDistancia = -1;             // última lectura válida (cm)
+float ultimaDistancia = -1;             
 unsigned long ultimoPublicar = 0;
 unsigned long ultimoPing = 0;
+bool ledEncendido = true; // Controla si el LED está activo (Toggle ON) o apagado (Toggle OFF)
 
 // ---------------------- PROTOTIPOS ----------------------
 void conectarWiFi();
@@ -62,13 +64,35 @@ void setup() {
   escribirRGB(255, 255, 255);   
 
   conectarWiFi();
+
+  // PASO 2: Registrar la suscripción al feed en setup()
+  mqtt.subscribe(&feedLedToggle);
 }
 
 // =====================================================================
 void loop() {
-  conectarMQTT();   // mantiene la conexión con Adafruit (reconecta si se cae)
+  conectarMQTT(); // Mantiene la conexión con Adafruit IO
 
-  // Leer el ultrasónico y publicar cada cierto tiempo
+  // PASO 3: Revisar si llegaron mensajes del botón Toggle desde el Dashboard
+  Adafruit_MQTT_Subscribe *subscription;
+  while ((subscription = mqtt.readSubscription(20))) { // Tiempo de espera breve de 20ms
+    if (subscription == &feedLedToggle) {
+      char *mensaje = (char *)feedLedToggle.lastread;
+      Serial.print("Comando de LED recibido desde Adafruit: ");
+      Serial.println(mensaje);
+
+      // Comprobar la orden enviada por el Toggle (ON/OFF o 1/0)
+      if (strcmp(mensaje, "ON") == 0 || strcmp(mensaje, "1") == 0) {
+        ledEncendido = true;
+      } else if (strcmp(mensaje, "OFF") == 0 || strcmp(mensaje, "0") == 0) {
+        ledEncendido = false;
+      }
+
+      actualizarLED(); // Aplicar el cambio de estado de forma inmediata
+    }
+  }
+
+  // Leer el ultrasónico y publicar la distancia periódicamente
   if (millis() - ultimoPublicar >= INTERVALO_PUBLICAR_MS) {
     ultimoPublicar = millis();
 
@@ -84,7 +108,7 @@ void loop() {
       Serial.println("Lectura fuera de rango o sin eco");
     }
 
-    actualizarLED();   // el color depende de la última distancia leída
+    actualizarLED(); // Refrescar el color según la distancia
   }
 
   // Mantener viva la conexión MQTT
@@ -105,23 +129,21 @@ float leerDistanciaCm() {
   digitalWrite(TRIG_PIN, LOW);
 
   long duracion = pulseIn(ECHO_PIN, HIGH, 30000);
-  if (duracion == 0) return -1;   // no hubo eco
+  if (duracion == 0) return -1;
 
   float distancia = (duracion * 0.0343) / 2;
 
-  // Rango útil del sensor: 2 a 100 cm
   if (distancia < 2 || distancia > 100) return -1;
   return distancia;
 }
 
-// Promedia varias lecturas para reducir el ruido
 float distanciaPromedio(int muestras) {
   float suma = 0;
   int validas = 0;
   for (int i = 0; i < muestras; i++) {
     float d = leerDistanciaCm();
     if (d > 0) { suma += d; validas++; }
-    delay(40);   
+    delay(40);
   }
   return (validas > 0) ? suma / validas : -1;
 }
@@ -138,19 +160,26 @@ void escribirRGB(uint8_t r, uint8_t g, uint8_t b) {
   ledcWrite(PIN_B, b);
 }
 
-// El color debe cambiar solo según la última distancia leída.
 void actualizarLED() {
-  if (ultimaDistancia <= 0) {
-    escribirRGB(255, 255, 255);   
+  // Si el Toggle en Adafruit se desactivó, apagar completamente el LED
+  if (!ledEncendido) {
+    escribirRGB(0, 0, 0); 
     return;
   }
 
+  // Si no hay lectura válida de distancia
+  if (ultimaDistancia <= 0) {
+    escribirRGB(255, 255, 255); 
+    return;
+  }
+
+  // Control según rango de distancia
   if (ultimaDistancia < DIST_CERCA_CM) {
-    escribirRGB(255, 0, 0);       // 
+    escribirRGB(255, 0, 0);       // Rojo: Cerca
   } else if (ultimaDistancia < DIST_MEDIA_CM) {
-    escribirRGB(255, 255, 0);     // 
+    escribirRGB(255, 255, 0);     // Amarillo: Distancia media
   } else {
-    escribirRGB(0, 255, 0);       // 
+    escribirRGB(0, 255, 0);       // Verde: Lejos
   }
 }
 
@@ -176,9 +205,9 @@ void conectarMQTT() {
   uint8_t intentos = 3;
   while ((ret = mqtt.connect()) != 0) {         
     Serial.println(mqtt.connectErrorString(ret));
-    Serial.println("Reintentando en 1 segundo...");
+    Serial.println("Reintentando en 5 segundos...");
     mqtt.disconnect();
-    delay(1000);
+    delay(5000);
     if (--intentos == 0) {
       Serial.println("No se pudo conectar. Reiniciando la ESP32...");
       ESP.restart();
